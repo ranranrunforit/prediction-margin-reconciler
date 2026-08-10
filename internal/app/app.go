@@ -287,15 +287,20 @@ func (a *App) settleFacts(ctx context.Context) error {
 	if len(facts) == 0 {
 		return nil
 	}
-	finalHeight := a.Chain.VaultState().FinalizedHeight
 	orphaned := map[string]bool{}
 	for _, f := range facts {
+		// A fact is live only when the chain's authoritative nonce lookup still
+		// points at the exact block from which we derived the ledger credit.
+		// CanonicalHash alone is an index over the block tree; TxStatus ties that
+		// block back to the specific deposit and avoids compensating a valid
+		// credit merely because the event cursor is behind.
+		st := a.Chain.TxStatus(f.FactID)
 		canon, ok := a.Chain.CanonicalHash(f.Height)
-		if !ok || canon != f.BlockHash {
+		if !st.Processed || st.BlockHash != f.BlockHash || !ok || canon != f.BlockHash {
 			orphaned[f.BlockHash] = true
 			continue
 		}
-		if f.Height <= finalHeight {
+		if st.Finalized {
 			if err := a.Store.MarkFactFinalized(ctx, f.EventID); err != nil {
 				return err
 			}

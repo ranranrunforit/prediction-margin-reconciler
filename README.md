@@ -347,6 +347,10 @@ go run ./cmd/pmr chaos -iterations 5000 -seed 7 -crash-every 10 -v
 go run ./cmd/pmr verify -chain-state /tmp/pmr-chain.json -settle
 ```
 
+`demo` and `chaos` reset the shared `pmr` schema. Run them with no `pmr serve`
+process active against that database; a second process connected to a different
+simulated-chain state can otherwise try to resolve the test intents.
+
 `DATABASE_URL` and `REDIS_URL` override the defaults. CI runs `go vet`, `gofmt`,
 the test suite, the narrated demo, five chaos seeds and the SIGKILL test on every
 push.

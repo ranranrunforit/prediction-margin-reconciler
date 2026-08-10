@@ -41,4 +41,6 @@ jobs:
             go run ./cmd/pmr chaos -iterations 1500 -seed $s -crash-every 25 -verify-every 100
           done
       - name: real SIGKILL recovery
-        run: ./scripts/crash_test.sh
+        # Invoke bash explicitly: Git commits created on Windows often do not
+        # preserve the executable bit on shell scripts.
+        run: bash ./scripts/crash_test.sh

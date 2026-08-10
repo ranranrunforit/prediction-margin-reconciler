@@ -28,6 +28,7 @@ var Invariants = []struct{ ID, Name string }{
 	{"I4", "margin balances equal the collateral on open positions"},
 	{"I5", "each idempotency key maps to exactly one transfer"},
 	{"I6", "no in-flight intent is orphaned; funds are never left dangling"},
+	{"I7", "per-market escrow converges on ledger collateral and never stalls"},
 }
 
 // Verify checks every invariant. In strict mode it additionally requires the
@@ -195,7 +196,33 @@ func (a *App) Verify(ctx context.Context, strict bool) ([]Violation, error) {
 	}
 	rows.Close()
 
+	// I7 -- the second reconciliation dimension. I2 proves we hold the right
+	// *total*; it says nothing about whether that total is earmarked against the
+	// right markets, because moving funds into escrow does not change the vault
+	// balance at all.
+	esc, err := a.ReconcileEscrow(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	// Drift itself is normal -- trading is off-chain and the chain converges
+	// behind it. Only a gap that has stopped moving across passes is a bug.
+	stuck, err := a.StuckEscrow(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range stuck {
+		add("I7", nameOf("I7"), "%s: ledger holds %s, vault escrows %s, unchanged for %d passes",
+			d.Market, core.USD(d.Collateral), core.USD(d.OnChain), d.Misses)
+	}
+
 	if strict {
+		if esc.Unexplained != 0 {
+			add("I7", nameOf("I7"), "strict mode: %d market(s) out of sync with no instruction in flight",
+				esc.Unexplained)
+		}
+		if esc.Explained != 0 {
+			add("I7", nameOf("I7"), "strict mode: %d escrow instruction(s) still in flight", esc.Explained)
+		}
 		if rep.InFlight != 0 {
 			add("I6", nameOf("I6"), "strict mode: %d intent(s) still in flight", rep.InFlight)
 		}

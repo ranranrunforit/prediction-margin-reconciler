@@ -384,3 +384,106 @@ func (s *Store) ConfirmedIntentsInBlock(ctx context.Context, blockHash string) (
 	}
 	return out, rows.Err()
 }
+
+// RequestEscrowSet asks the vault to earmark exactly `target` for a market.
+//
+// No funds move in the ledger: escrow is a claim on money the vault already
+// holds, so this changes nothing about who owns what. It exists so the chain's
+// own accounting reflects how much of custody is backing open positions, which
+// gives reconciliation a second, independent dimension to check.
+//
+// The call carries an absolute target rather than a delta. Under an unknown
+// receipt we may submit the same intent several times, and an assignment
+// converges where an increment would compound. Only one escrow intent per market
+// is allowed in flight at a time, so a stale target cannot land after a fresh
+// one; if it somehow did, the next sync pass corrects it.
+func (s *Store) RequestEscrowSet(ctx context.Context, marketID string, target, expiryHeight int64) (string, bool, error) {
+	var id string
+	var replayed bool
+	err := tx(ctx, s.db, func(x *sql.Tx) error {
+		// The partial unique index on (market_id) for in-flight escrow intents
+		// is the guard, so this is a fast path rather than the correctness
+		// mechanism. Note what is deliberately NOT used here: an idempotency key
+		// derived from the target value. Escrow instructions are legitimately
+		// re-issued for the same value after one expires, and a value-keyed
+		// insert would silently return the dead intent and never write a new
+		// outbox row -- leaving the market permanently unsynced. Idempotency has
+		// to key on the thing that is actually unique, which here is "an
+		// instruction is in flight for this market".
+		var existing string
+		err := x.QueryRowContext(ctx, `
+            select id from intents
+             where kind = 'escrow_set' and market_id = $1 and state in ('reserved', 'submitted')
+             order by created_at limit 1`, marketID).Scan(&existing)
+		if err == nil {
+			id, replayed = existing, true
+			return nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+
+		id = NewID()
+		if _, err := x.ExecContext(ctx, `
+            insert into intents (id, kind, market_id, amount, state, deadline, expiry_height)
+            values ($1, 'escrow_set', $2, $3, $4, now() + interval '60 seconds', $5)`,
+			id, marketID, target, StateReserved, expiryHeight); err != nil {
+			return err
+		}
+		payload, _ := json.Marshal(map[string]any{
+			"nonce": id, "kind": "escrow_set", "market_id": marketID,
+			"target": target, "expiry_height": expiryHeight})
+		_, err = x.ExecContext(ctx, `
+            insert into outbox (intent_id, op, payload) values ($1, 'escrow_set', $2)
+            on conflict (intent_id, op) do nothing`, id, payload)
+		return err
+	})
+	return id, replayed, err
+}
+
+// MarketCollateral is the collateral the ledger holds against each open market.
+// This is the number the on-chain escrow is supposed to mirror.
+func (s *Store) MarketCollateral(ctx context.Context) (map[string]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `
+        select m.id, coalesce(sum(p.collateral) filter (where p.state = 'open'), 0)
+          from markets m left join positions p on p.market_id = m.id
+         where m.state <> 'settled'
+         group by m.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var id string
+		var v int64
+		if err := rows.Scan(&id, &v); err != nil {
+			return nil, err
+		}
+		out[id] = v
+	}
+	return out, rows.Err()
+}
+
+// InFlightEscrowTargets maps a market to the escrow level an in-flight intent is
+// trying to install. The reconciler uses it to explain a legitimate gap between
+// ledger collateral and on-chain escrow.
+func (s *Store) InFlightEscrowTargets(ctx context.Context) (map[string]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `
+        select market_id, amount from intents
+         where kind = 'escrow_set' and state in ('reserved', 'submitted')`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var id string
+		var v int64
+		if err := rows.Scan(&id, &v); err != nil {
+			return nil, err
+		}
+		out[id] = v
+	}
+	return out, rows.Err()
+}

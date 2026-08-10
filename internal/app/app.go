@@ -376,7 +376,22 @@ func (a *App) ResolverTick(ctx context.Context) (int, error) {
 			continue
 		}
 
-		expiredByContract := it.ExpiryHt > 0 && head > it.ExpiryHt
+		pastExpiry := it.ExpiryHt > 0 && head > it.ExpiryHt
+		noFundsAtRisk := it.Kind != "withdraw"
+
+		// For a withdrawal we do not settle for "the height has passed, so it
+		// probably cannot land". We make it impossible: ask the contract to
+		// permanently refuse the nonce, and only release the reservation once it
+		// confirms. Height alone is an inference about the chain; a cancellation
+		// is a fact recorded by the chain.
+		if pastExpiry && !noFundsAtRisk && !a.Chain.Expired(it.ID) {
+			if !a.Chain.Cancel(it.ID, it.ExpiryHt) {
+				continue // cancellation queued or refused; try again next pass
+			}
+		}
+
+		cancelled := a.Chain.Expired(it.ID)
+		expiredByContract := pastExpiry && (cancelled || noFundsAtRisk)
 		expiredWithoutContract := it.ExpiryHt == 0 && time.Now().After(it.Deadline)
 		if expiredByContract || expiredWithoutContract {
 			// We only refund after the chain has advanced past the nonce's

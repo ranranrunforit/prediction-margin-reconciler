@@ -54,6 +54,10 @@ func main() {
 		err = cmdDemo(ctx, os.Args[2:])
 	case "serve":
 		err = cmdServe(ctx, os.Args[2:])
+	case "bench":
+		err = cmdBench(ctx, os.Args[2:])
+	case "trace":
+		err = cmdTrace(ctx, os.Args[2:])
 	case "verify":
 		err = cmdVerify(ctx, os.Args[2:])
 	case "reset", "migrate":
@@ -76,9 +80,10 @@ func usage() {
 	fmt.Fprint(os.Stderr, `pmr -- prediction-market margin and reconciliation engine
 
   pmr chaos   [-iterations N] [-seed N] [-crash-every N] [-verify-every N]
-              [-users N] [-markets N] [-clean] [-fresh] [-json]
+              [-users N] [-markets N] [-clean] [-fresh] [-json] [-trace PATH]
   pmr demo    [-seed N]
   pmr serve   [-addr :8080] [-fresh]
+  pmr bench   [-markets N] [-ticks N] [-writers N] [-transfers N]
   pmr verify  [-strict] [-settle] [-chain-state PATH]
   pmr reset
 
@@ -114,6 +119,7 @@ func cmdChaos(ctx context.Context, args []string) error {
 	clean := fs.Bool("clean", false, "run with no injected faults (control group)")
 	fresh := fs.Bool("fresh", true, "reset the database first")
 	asJSON := fs.Bool("json", false, "emit the result as JSON")
+	trace := fs.String("trace", "", "export the finalised vault history here for the Rust replay test")
 	verbose := fs.Bool("v", false, "verbose logging")
 	_ = fs.Parse(args)
 
@@ -133,7 +139,7 @@ func cmdChaos(ctx context.Context, args []string) error {
 		DSN: defaultDSN(), RedisURL: os.Getenv("REDIS_URL"), ChainState: statePath,
 		Seed: *seed, Iterations: *iters, Users: *users, Markets: *markets,
 		VerifyEvery: *verify, CrashEvery: *crash, Faults: faults,
-		LogLevel: level, Fresh: *fresh,
+		LogLevel: level, Fresh: *fresh, TracePath: *trace,
 	})
 	if err != nil {
 		return err
@@ -470,5 +476,61 @@ func cmdDemo(ctx context.Context, args []string) error {
 
 	fmt.Printf("\n%s\nrun `pmr chaos` for the same properties under 1000 randomised operations\n",
 		strings.Repeat("=", 66))
+	return nil
+}
+
+func cmdBench(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("bench", flag.ExitOnError)
+	markets := fs.Int("markets", 2000, "markets in the price fan-out")
+	ticks := fs.Int("ticks", 20, "price ticks per market")
+	writers := fs.Int("writers", 8, "concurrent ledger writers")
+	transfers := fs.Int("transfers", 250, "transfers per writer")
+	hot := fs.Int("hot-accounts", 4, "accounts the writers contend over")
+	_ = fs.Parse(args)
+
+	a, err := app.New(ctx, app.Options{DSN: defaultDSN(), RedisURL: os.Getenv("REDIS_URL"),
+		Faults: chain.NoFaults(), LogLevel: slog.LevelError})
+	if err != nil {
+		return err
+	}
+	defer a.Close()
+	if err := core.Reset(ctx, a.DB()); err != nil {
+		return err
+	}
+	res, err := a.Bench(ctx, app.BenchOptions{Markets: *markets, Ticks: *ticks,
+		Writers: *writers, Transfers: *transfers, HotAccounts: *hot})
+	if err != nil {
+		return err
+	}
+	fmt.Print(res.String())
+	return nil
+}
+
+// cmdTrace runs a short chaos workload purely to export a finalised vault
+// history, then tells you how to replay it through the Rust contract.
+func cmdTrace(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("trace", flag.ExitOnError)
+	out := fs.String("out", "/tmp/pmr-trace.txt", "where to write the trace")
+	iters := fs.Int("iterations", 1500, "workload operations")
+	seed := fs.Int64("seed", 1, "random seed")
+	_ = fs.Parse(args)
+
+	statePath := fmt.Sprintf("%s/pmr-trace-chain-%d.json", os.TempDir(), *seed)
+	_ = os.Remove(statePath)
+	res, err := app.RunChaos(ctx, app.ChaosOptions{
+		DSN: defaultDSN(), RedisURL: os.Getenv("REDIS_URL"), ChainState: statePath,
+		Seed: *seed, Iterations: *iters, VerifyEvery: 500, CrashEvery: 50,
+		Faults: chain.DefaultFaults(), LogLevel: slog.LevelError, Fresh: true,
+		TracePath: *out,
+	})
+	if err != nil {
+		return err
+	}
+	if len(res.Violations) > 0 {
+		fmt.Print(res.String())
+		return errors.New("invariant violation while generating the trace")
+	}
+	fmt.Printf("wrote %s\n  replay it with: cargo run --manifest-path contracts/vault/Cargo.toml --bin replay -- %s\n",
+		*out, *out)
 	return nil
 }

@@ -196,6 +196,9 @@ func (a *App) Quiesce(ctx context.Context, maxRounds int) error {
 		if _, err := a.ResolverTick(ctx); err != nil {
 			return err
 		}
+		if _, err := a.EscrowTick(ctx); err != nil {
+			return err
+		}
 
 		inflight, err := a.Store.InFlight(ctx)
 		if err != nil {
@@ -209,7 +212,12 @@ func (a *App) Quiesce(ctx context.Context, maxRounds int) error {
 		if err != nil {
 			return err
 		}
-		if len(inflight) == 0 && len(pending) == 0 && prov == 0 {
+		esc, err := a.ReconcileEscrow(ctx, false)
+		if err != nil {
+			return err
+		}
+		if len(inflight) == 0 && len(pending) == 0 && prov == 0 &&
+			esc.Unexplained == 0 && esc.Explained == 0 {
 			if _, err := a.Reconcile(ctx); err != nil {
 				return err
 			}

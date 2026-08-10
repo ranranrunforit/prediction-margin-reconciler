@@ -1,5 +1,13 @@
-bin/
+# Leading slashes matter here. A bare `bin/` matches a directory called `bin` at
+# ANY depth, which silently swallowed contracts/vault/src/bin/replay.rs and made
+# CI fail with "can't find bin `replay`". Anchor every build-output path.
+/bin/
+/ts/dist/
+/ts/node_modules/
+/contracts/vault/target/
+
 *.log
-/tmp/
-pmr-chain*.json
+dump.rdb
 .DS_Store
+pmr-chain*.json
+pmr-trace*.txt

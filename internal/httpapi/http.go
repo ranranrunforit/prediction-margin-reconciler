@@ -119,6 +119,17 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 		br.Close()
 	}
 
+	esc, err := s.A.ReconcileEscrow(ctx, false)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	stuck, err := s.A.StuckEscrow(ctx)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+
 	freezes, _ := s.A.Store.Freezes(ctx)
 	markets, _ := s.A.Store.Markets(ctx)
 	margin, _ := s.A.Store.MarginTotal(ctx)
@@ -136,16 +147,22 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, 200, map[string]any{
 		"reconciliation": rep,
-		"violations":     viol,
-		"invariants":     app.Invariants,
-		"intents":        rows,
-		"balances":       bals,
-		"freezes":        freezes,
-		"markets":        mrows,
-		"chain":          s.A.Chain.Snapshot(),
-		"margin":         margin,
-		"collateral":     collateral,
-		"feed":           s.A.Feed.Name(),
+		"escrow": map[string]any{
+			"unexplained": esc.Unexplained, "explained": esc.Explained,
+			"stuck": len(stuck), "synced": esc.Synced, "markets": esc.Markets,
+			"total_ledger_collateral": esc.TotalLedger, "total_chain_escrow": esc.TotalChain,
+			"drifts": esc.Drifts,
+		},
+		"violations": viol,
+		"invariants": app.Invariants,
+		"intents":    rows,
+		"balances":   bals,
+		"freezes":    freezes,
+		"markets":    mrows,
+		"chain":      s.A.Chain.Snapshot(),
+		"margin":     margin,
+		"collateral": collateral,
+		"feed":       s.A.Feed.Name(),
 	})
 }
 

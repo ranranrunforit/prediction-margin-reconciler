@@ -1,7 +1,7 @@
 // Package chain is a deliberately hostile simulation of an L2.
 //
 // The point is not to imitate a specific chain. The point is to reproduce the
-// four things that actually break off-chain accounting:
+// things that actually break off-chain accounting:
 //
 //  1. duplicate event delivery
 //  2. gaps and reordering in the event stream
@@ -15,6 +15,11 @@
 //
 // The recovery design of the whole system rests on that split. Events make us
 // fast; the truthful tier is what we fall back to when events lie.
+//
+// The execution rules in applyTx are a mirror of the Rust contract in
+// contracts/vault. They are not merely similar by intention: `make differential`
+// replays this simulator's finalised history through the real Rust
+// implementation and fails if the two disagree by a single unit.
 package chain
 
 import (
@@ -23,6 +28,8 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 )
 
@@ -33,23 +40,18 @@ var (
 	ErrExpired = errors.New("chain: nonce expired")
 )
 
-// Expired reports whether the contract has permanently refused a nonce.
-func (s *Sim) Expired(nonce string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.expired[nonce]
-}
-
-// Tx is a call we ask the vault contract to make. Nonce is the caller-supplied
-// idempotency key; the contract records processed nonces and treats a repeat
-// as a no-op. That property is what makes retry-on-unknown safe.
+// Tx is a call into the vault contract.
 type Tx struct {
 	Nonce    string `json:"nonce"`
-	Kind     string `json:"kind"` // withdraw | settle_market
+	Kind     string `json:"kind"` // deposit | withdraw | escrow_set | settle_market | cancel
 	User     string `json:"user,omitempty"`
 	Amount   int64  `json:"amount,omitempty"`
 	MarketID string `json:"market_id,omitempty"`
-	Outcome  int64  `json:"outcome,omitempty"`
+	// Target is the absolute escrow level for escrow_set. Absolute, not a
+	// delta: under an unknown receipt the same intent may be submitted several
+	// times, and an assignment converges where an increment compounds.
+	Target  int64 `json:"target,omitempty"`
+	Outcome int64 `json:"outcome,omitempty"`
 	// ExpiryHeight makes the contract refuse the call after a deadline it can
 	// check itself. Without it, an off-chain timeout is only a guess: a tx that
 	// sat in the mempool (or came back from a reorg) can still land after we
@@ -61,10 +63,11 @@ type Event struct {
 	Seq       int64  `json:"seq"`
 	ID        string `json:"id"` // dedupe key for the *event*
 	Kind      string `json:"kind"`
-	FactID    string `json:"fact_id"` // dedupe key for the *effect* (see README)
+	FactID    string `json:"fact_id"` // dedupe key for the *effect*
 	User      string `json:"user,omitempty"`
 	Amount    int64  `json:"amount,omitempty"`
 	MarketID  string `json:"market_id,omitempty"`
+	Target    int64  `json:"target,omitempty"`
 	Outcome   int64  `json:"outcome,omitempty"`
 	Height    int64  `json:"height"`
 	BlockHash string `json:"block_hash"`
@@ -75,13 +78,29 @@ type TxStatus struct {
 	Finalized bool   `json:"finalized"`
 	Height    int64  `json:"height"`
 	BlockHash string `json:"block_hash"`
+	// Rejected is set when the contract executed the call and refused it for a
+	// reason that cannot change. The engine can act on that immediately instead
+	// of waiting out a timeout.
+	Rejected string `json:"rejected,omitempty"`
 }
 
 type VaultState struct {
-	FinalizedBalance int64 `json:"finalized_balance"`
-	HeadBalance      int64 `json:"head_balance"`
-	Head             int64 `json:"head"`
-	FinalizedHeight  int64 `json:"finalized_height"`
+	FinalizedBalance int64            `json:"finalized_balance"`
+	FinalizedFree    int64            `json:"finalized_free"`
+	FinalizedEscrow  map[string]int64 `json:"finalized_escrow"`
+	HeadBalance      int64            `json:"head_balance"`
+	Head             int64            `json:"head"`
+	FinalizedHeight  int64            `json:"finalized_height"`
+}
+
+func (v VaultState) EscrowOf(market string) int64 { return v.FinalizedEscrow[market] }
+
+func (v VaultState) EscrowTotal() int64 {
+	var t int64
+	for _, e := range v.FinalizedEscrow {
+		t += e
+	}
+	return t
 }
 
 // Faults are probabilities in [0,1].
@@ -102,47 +121,172 @@ func DefaultFaults() Faults {
 
 func NoFaults() Faults { return Faults{Confirms: 2} }
 
+// ---------------------------------------------------------------- vault state
+
+// vault is the contract's storage. It is a value type that clones cheaply,
+// because a reorg is modelled by recomputing head state from finalised state
+// plus the surviving pending blocks. Recomputing is far easier to get right than
+// unwinding, and the pending window is bounded by finality.
+type vault struct {
+	Balance   int64            `json:"balance"`
+	Escrow    map[string]int64 `json:"escrow"`
+	Settled   map[string]bool  `json:"settled"`
+	Processed map[string]bool  `json:"processed"`
+	Cancelled map[string]bool  `json:"cancelled"`
+}
+
+func newVault() vault {
+	return vault{Escrow: map[string]int64{}, Settled: map[string]bool{},
+		Processed: map[string]bool{}, Cancelled: map[string]bool{}}
+}
+
+func (v vault) clone() vault {
+	c := vault{Balance: v.Balance,
+		Escrow:    make(map[string]int64, len(v.Escrow)),
+		Settled:   make(map[string]bool, len(v.Settled)),
+		Processed: make(map[string]bool, len(v.Processed)),
+		Cancelled: make(map[string]bool, len(v.Cancelled))}
+	for k, x := range v.Escrow {
+		c.Escrow[k] = x
+	}
+	for k, x := range v.Settled {
+		c.Settled[k] = x
+	}
+	for k, x := range v.Processed {
+		c.Processed[k] = x
+	}
+	for k, x := range v.Cancelled {
+		c.Cancelled[k] = x
+	}
+	return c
+}
+
+func (v vault) escrowTotal() int64 {
+	var t int64
+	for _, e := range v.Escrow {
+		t += e
+	}
+	return t
+}
+
+// free is custody not earmarked for a market: the only funds a withdrawal may
+// draw on.
+func (v vault) free() int64 { return v.Balance - v.escrowTotal() }
+
+// applyTx is the contract. Mirror of Vault::execute in contracts/vault.
+//
+// The check order matters. Dedupe comes before expiry, so a late retry of a call
+// that already landed reports "already processed" and not "expired". The other
+// order would have the engine refund money the vault had already paid out.
+//
+// A refusal is either permanent (returned as a reason, so the engine can act at
+// once) or transient (empty reason, nonce not consumed, outbox free to retry).
+func (v *vault) applyTx(tx Tx, height int64) (permanentReject string, ok bool) {
+	if v.Processed[tx.Nonce] {
+		return "already_processed", false
+	}
+	if v.Cancelled[tx.Nonce] {
+		return "expired", false
+	}
+	if tx.Kind != "cancel" && tx.ExpiryHeight > 0 && height > tx.ExpiryHeight {
+		return "expired", false
+	}
+
+	switch tx.Kind {
+	case "deposit":
+		if tx.Amount <= 0 {
+			return "zero_amount", false
+		}
+		v.Balance += tx.Amount
+
+	case "withdraw":
+		if tx.Amount <= 0 {
+			return "zero_amount", false
+		}
+		if v.free() < tx.Amount {
+			return "", false // transient: free custody may arrive later
+		}
+		v.Balance -= tx.Amount
+
+	case "escrow_set":
+		if v.Settled[tx.MarketID] {
+			return "market_settled", false
+		}
+		cur := v.Escrow[tx.MarketID]
+		if tx.Target > cur && v.free() < tx.Target-cur {
+			return "", false // transient: not enough free custody yet
+		}
+		if tx.Target == 0 {
+			delete(v.Escrow, tx.MarketID)
+		} else {
+			v.Escrow[tx.MarketID] = tx.Target
+		}
+
+	case "settle_market":
+		if v.Settled[tx.MarketID] {
+			return "market_settled", false
+		}
+		// Releasing escrow does not move money out of the vault, it just stops
+		// earmarking it. Who gets paid is the ledger's business.
+		delete(v.Escrow, tx.MarketID)
+		v.Settled[tx.MarketID] = true
+
+	case "cancel":
+		if tx.ExpiryHeight == 0 || height <= tx.ExpiryHeight {
+			return "not_yet_expired", false
+		}
+		v.Cancelled[tx.Nonce] = true
+		return "", true // a cancel does not consume its own nonce slot
+
+	default:
+		return "unknown_call", false
+	}
+
+	v.Processed[tx.Nonce] = true
+	return "", true
+}
+
+// ---------------------------------------------------------------- sim
+
 type block struct {
 	Height int64  `json:"height"`
 	Hash   string `json:"hash"`
 	Txs    []Tx   `json:"txs"`
-	Log    []int  `json:"log"` // indexes into Sim.log produced by this block
+	Log    []int  `json:"log"`
 }
 
 type persisted struct {
-	Head            int64            `json:"head"`
-	FinalizedHeight int64            `json:"finalized_height"`
-	FinalizedBal    int64            `json:"finalized_balance"`
-	Pending         []block          `json:"pending"`
-	Finalised       map[string]block `json:"finalised_hashes"` // height -> block (hash only, for CanonicalHash)
-	Processed       map[string]TxStatus
-	Log             []Event         `json:"log"`
-	Seq             int64           `json:"seq"`
-	Mempool         []Tx            `json:"mempool"`
-	Expired         map[string]bool `json:"expired"`
-	Faults          Faults          `json:"faults"`
+	Head        int64               `json:"head"`
+	FinalHeight int64               `json:"finalized_height"`
+	Final       vault               `json:"final"`
+	Pending     []block             `json:"pending"`
+	HashAt      map[string]string   `json:"hash_at"`
+	Receipts    map[string]TxStatus `json:"receipts"`
+	Log         []Event             `json:"log"`
+	Seq         int64               `json:"seq"`
+	Mempool     []Tx                `json:"mempool"`
+	Faults      Faults              `json:"faults"`
+	NextDeposit int64               `json:"next_deposit"`
 }
 
-// Sim is the chain. It is intentionally the only mutable state in the system
-// that does NOT live in Postgres, because that is the situation we are trying
-// to survive: an authority we cannot roll back.
 type Sim struct {
 	mu   sync.Mutex
 	rnd  *rand.Rand
 	path string
 
-	head         int64
-	finalHeight  int64
-	finalBalance int64
-	pending      []block
-	hashAt       map[int64]string
-	processed    map[string]TxStatus
-	log          []Event
-	seq          int64
-	mempool      []Tx
-	expired      map[string]bool
-	faults       Faults
-	nextDeposit  int64
+	head        int64
+	finalHeight int64
+	final       vault
+	pending     []block
+	hashAt      map[int64]string
+	receipts    map[string]TxStatus
+	log         []Event
+	seq         int64
+	mempool     []Tx
+	faults      Faults
+	nextDeposit int64
+
+	trace *os.File
 }
 
 func New(seed int64, f Faults, statePath string) *Sim {
@@ -150,17 +294,76 @@ func New(seed int64, f Faults, statePath string) *Sim {
 		f.Confirms = 2
 	}
 	s := &Sim{
-		rnd:       rand.New(rand.NewSource(seed)),
-		path:      statePath,
-		hashAt:    map[int64]string{},
-		processed: map[string]TxStatus{},
-		expired:   map[string]bool{},
-		faults:    f,
+		rnd: rand.New(rand.NewSource(seed)), path: statePath,
+		final: newVault(), hashAt: map[int64]string{},
+		receipts: map[string]TxStatus{}, faults: f,
 	}
 	if statePath != "" {
 		_ = s.load()
 	}
 	return s
+}
+
+// TraceTo records every finalised call, in order, to a file the Rust contract
+// can replay. Finalised history only: it is the part that cannot be taken back,
+// which is what makes the comparison meaningful.
+func (s *Sim) TraceTo(path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	s.trace = f
+	fmt.Fprintln(f, "# finalised vault history exported by the Go simulator")
+	return nil
+}
+
+// CloseTrace writes the expected end state and closes the file.
+func (s *Sim) CloseTrace() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.trace == nil {
+		return nil
+	}
+	markets := make([]string, 0, len(s.final.Escrow))
+	for m := range s.final.Escrow {
+		markets = append(markets, m)
+	}
+	sort.Strings(markets)
+	fmt.Fprintf(s.trace, "expect balance %d\n", s.final.Balance)
+	fmt.Fprintf(s.trace, "expect escrow_total %d\n", s.final.escrowTotal())
+	for _, m := range markets {
+		fmt.Fprintf(s.trace, "expect escrow %s %d\n", m, s.final.Escrow[m])
+	}
+	err := s.trace.Close()
+	s.trace = nil
+	return err
+}
+
+func (s *Sim) writeTrace(tx Tx, height int64) {
+	if s.trace == nil {
+		return
+	}
+	switch tx.Kind {
+	case "deposit":
+		fmt.Fprintf(s.trace, "deposit %s %s %d %d\n", tx.Nonce, tx.User, tx.Amount, height)
+	case "withdraw":
+		fmt.Fprintf(s.trace, "withdraw %s %s %d %d %d\n",
+			tx.Nonce, tx.User, tx.Amount, tx.ExpiryHeight, height)
+	case "escrow_set":
+		fmt.Fprintf(s.trace, "escrow_set %s %s %d %d %d\n",
+			tx.Nonce, tx.MarketID, tx.Target, tx.ExpiryHeight, height)
+	case "settle_market":
+		o := 0
+		if tx.Outcome > 0 {
+			o = 1
+		}
+		fmt.Fprintf(s.trace, "settle %s %s %d %d %d\n",
+			tx.Nonce, tx.MarketID, o, tx.ExpiryHeight, height)
+	case "cancel":
+		fmt.Fprintf(s.trace, "cancel %s %d %d\n", tx.Nonce, tx.ExpiryHeight, height)
+	}
 }
 
 func (s *Sim) Faults() Faults {
@@ -180,11 +383,23 @@ func (s *Sim) SetFaults(f Faults) {
 
 func (s *Sim) hit(p float64) bool { return p > 0 && s.rnd.Float64() < p }
 
+// headLocked is the executing state: finalised state plus every surviving
+// pending block, replayed in order.
+func (s *Sim) headLocked() vault {
+	v := s.final.clone()
+	for _, b := range s.pending {
+		for _, tx := range b.Txs {
+			v.applyTx(tx, b.Height)
+		}
+	}
+	return v
+}
+
 // ---------------------------------------------------------------- writes
 
 // Deposit models a user sending funds straight to the vault contract. It is
-// chain-originated: we only learn about it through the event stream (fast) or
-// by scanning chain state (slow). Returns the fact id.
+// chain-originated: we learn about it through the event stream (fast) or by
+// scanning chain state (slow).
 func (s *Sim) Deposit(user string, amount int64) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -194,24 +409,25 @@ func (s *Sim) Deposit(user string, amount int64) string {
 	return id
 }
 
-// Submit sends a tx. Three outcomes, and the caller cannot tell the second
-// from the third:
+// Submit sends a tx. Three outcomes, and the caller cannot tell the second from
+// the third:
 //
 //	nil error   -> included
 //	error       -> not included
 //	error       -> included anyway (lost receipt)
 //
-// The only safe response to an error is to retry with the same nonce and let
-// the resolver find out the truth from TxStatus.
+// The only safe response to an error is to retry with the same nonce and let the
+// resolver learn the truth from TxStatus.
 func (s *Sim) Submit(tx Tx) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if st, ok := s.processed[tx.Nonce]; ok {
-		// Contract-level idempotency: replaying a nonce is a no-op.
-		return st.BlockHash, nil
+	if st, ok := s.receipts[tx.Nonce]; ok && st.Processed {
+		return st.BlockHash, nil // contract-level idempotency
 	}
-	if s.expired[tx.Nonce] || (tx.ExpiryHeight > 0 && s.head > tx.ExpiryHeight) {
-		s.expired[tx.Nonce] = true
+	if s.headLocked().Cancelled[tx.Nonce] {
+		return "", fmt.Errorf("%w: nonce %s was cancelled", ErrExpired, tx.Nonce)
+	}
+	if tx.Kind != "cancel" && tx.ExpiryHeight > 0 && s.head > tx.ExpiryHeight {
 		return "", fmt.Errorf("%w: nonce %s is past its expiry height", ErrExpired, tx.Nonce)
 	}
 	if s.hit(s.faults.SubmitError) {
@@ -226,7 +442,33 @@ func (s *Sim) Submit(tx Tx) (string, error) {
 	return "tx-" + tx.Nonce, nil
 }
 
-// Mine produces one block from the mempool, possibly reorging first.
+// Cancel asks the contract to permanently refuse a nonce. The engine calls it
+// before releasing an off-chain reservation, turning "this can never execute"
+// from an assumption into a fact recorded by the executing authority.
+//
+// Returns true only once the cancellation is in force.
+func (s *Sim) Cancel(nonce string, expiryHeight int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st, ok := s.receipts[nonce]; ok && st.Processed {
+		return false // too late, it landed
+	}
+	if s.headLocked().Cancelled[nonce] {
+		return true
+	}
+	if expiryHeight == 0 || s.head <= expiryHeight {
+		return false // could still legitimately execute
+	}
+	for _, tx := range s.mempool {
+		if tx.Nonce == nonce && tx.Kind == "cancel" {
+			return false // already queued
+		}
+	}
+	s.mempool = append(s.mempool, Tx{Nonce: nonce, Kind: "cancel", ExpiryHeight: expiryHeight})
+	return false
+}
+
+// Mine produces one block, possibly reorging first.
 func (s *Sim) Mine() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -237,37 +479,31 @@ func (s *Sim) Mine() {
 
 	s.head++
 	b := block{Height: s.head, Hash: fmt.Sprintf("0x%08x", s.rnd.Uint32())}
-	// The contract rejects anything past its own expiry height, and refuses a
-	// nonce it has already executed. Both checks belong here, at execution.
-	//
-	// An earlier version of this simulator deduped in Submit instead, which is
-	// wrong in a way that is easy to miss: a nonce that is sitting in the
-	// mempool is not yet "processed", so a retry appended it a second time and
-	// the same withdrawal executed twice in one block. The chaos harness caught
-	// it as a 5 USDC unexplained shortfall. A real contract has to make the
-	// same distinction.
+
+	state := s.headLocked()
 	pool := s.mempool
 	s.mempool = nil
-	staged := map[string]bool{}
 	for _, tx := range pool {
-		if _, done := s.processed[tx.Nonce]; done || staged[tx.Nonce] {
+		reason, ok := state.applyTx(tx, b.Height)
+		if !ok {
+			if reason != "" && reason != "already_processed" {
+				s.receipts[tx.Nonce] = TxStatus{Rejected: reason}
+			}
 			continue
 		}
-		if s.expired[tx.Nonce] || (tx.ExpiryHeight > 0 && b.Height > tx.ExpiryHeight) {
-			s.expired[tx.Nonce] = true
-			continue
-		}
-		staged[tx.Nonce] = true
 		b.Txs = append(b.Txs, tx)
 	}
+
 	for _, tx := range b.Txs {
-		s.processed[tx.Nonce] = TxStatus{Processed: true, Height: b.Height, BlockHash: b.Hash}
+		if tx.Kind != "cancel" {
+			s.receipts[tx.Nonce] = TxStatus{Processed: true, Height: b.Height, BlockHash: b.Hash}
+		}
 		s.seq++
 		ev := Event{Seq: s.seq, Kind: evKind(tx.Kind), FactID: tx.Nonce,
-			User: tx.User, Amount: tx.Amount, MarketID: tx.MarketID, Outcome: tx.Outcome,
-			Height: b.Height, BlockHash: b.Hash}
+			User: tx.User, Amount: tx.Amount, MarketID: tx.MarketID,
+			Target: tx.Target, Outcome: tx.Outcome, Height: b.Height, BlockHash: b.Hash}
 		// Event id is per (fact, block). A re-included fact after a reorg
-		// therefore arrives as a *new* event with the *same* fact id.
+		// arrives as a *new* event carrying the *same* fact id.
 		ev.ID = fmt.Sprintf("%s@%s", ev.FactID, b.Hash)
 		b.Log = append(b.Log, len(s.log))
 		s.log = append(s.log, ev)
@@ -278,19 +514,21 @@ func (s *Sim) Mine() {
 	for len(s.pending) > s.faults.Confirms {
 		f := s.pending[0]
 		s.pending = s.pending[1:]
-		s.finalBalance += balanceDelta(f.Txs)
-		s.finalHeight = f.Height
 		for _, tx := range f.Txs {
-			st := s.processed[tx.Nonce]
-			st.Finalized = true
-			s.processed[tx.Nonce] = st
+			s.final.applyTx(tx, f.Height)
+			s.writeTrace(tx, f.Height)
+			if st, ok := s.receipts[tx.Nonce]; ok && st.Processed {
+				st.Finalized = true
+				s.receipts[tx.Nonce] = st
+			}
 		}
+		s.finalHeight = f.Height
 	}
 	s.persistLocked()
 }
 
 // reorgLocked drops the newest unfinalised block(s) and rebuilds them with
-// different hashes and a different tx order. Finalised history is untouched —
+// different hashes and a different tx order. Finalised history is untouched --
 // that is the entire meaning of finality.
 func (s *Sim) reorgLocked() {
 	depth := 1 + s.rnd.Intn(len(s.pending))
@@ -301,15 +539,14 @@ func (s *Sim) reorgLocked() {
 	for _, b := range orphaned {
 		delete(s.hashAt, b.Height)
 		for _, tx := range b.Txs {
-			delete(s.processed, tx.Nonce)
+			delete(s.receipts, tx.Nonce)
 			reinclude = append(reinclude, tx)
 		}
 		for _, i := range b.Log {
-			s.log[i].Kind = "orphaned" // still in the log; a late poll may see it
+			s.log[i].Kind = "orphaned"
 		}
 	}
 	s.head -= int64(depth)
-	// Shuffle: the same facts, a different order, different block hashes.
 	s.rnd.Shuffle(len(reinclude), func(i, j int) { reinclude[i], reinclude[j] = reinclude[j], reinclude[i] })
 	s.mempool = append(reinclude, s.mempool...)
 }
@@ -318,8 +555,7 @@ func (s *Sim) reorgLocked() {
 
 // PollEvents is the fast, unreliable tier. It duplicates, reorders and
 // withholds. Because seq numbers are contiguous, a consumer can detect a
-// withheld event as a gap and refuse to advance its cursor past it — which is
-// exactly what the inbox worker does.
+// withheld event as a gap and refuse to advance its cursor past it.
 func (s *Sim) PollEvents(since int64, limit int) []Event {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -332,7 +568,7 @@ func (s *Sim) PollEvents(since int64, limit int) []Event {
 			break
 		}
 		if s.hit(s.faults.Gap) {
-			continue // withheld this round; the consumer will see the gap
+			continue
 		}
 		out = append(out, ev)
 		if s.hit(s.faults.Duplicate) {
@@ -349,11 +585,33 @@ func (s *Sim) PollEvents(since int64, limit int) []Event {
 func (s *Sim) TxStatus(nonce string) TxStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.processed[nonce]
+	return s.receipts[nonce]
 }
 
-// FinalizedFacts lists every finalised fact of a kind. The reconciler uses it
-// to heal from permanently-lost events without trusting the stream at all.
+// Expired reports whether the contract has permanently refused a nonce.
+func (s *Sim) Expired(nonce string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st, ok := s.receipts[nonce]; ok {
+		if st.Processed {
+			return false
+		}
+		if st.Rejected == "expired" {
+			return true
+		}
+	}
+	return s.headLocked().Cancelled[nonce]
+}
+
+// Rejected returns a permanent rejection reason, if the contract gave one.
+func (s *Sim) Rejected(nonce string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.receipts[nonce].Rejected
+}
+
+// FinalizedFacts lists every finalised fact of a kind. The reconciler uses it to
+// heal from permanently-lost events without trusting the stream at all.
 func (s *Sim) FinalizedFacts(kind string) []Event {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -362,7 +620,7 @@ func (s *Sim) FinalizedFacts(kind string) []Event {
 		if ev.Kind != kind {
 			continue
 		}
-		if st, ok := s.processed[ev.FactID]; ok && st.Finalized && st.BlockHash == ev.BlockHash {
+		if st, ok := s.receipts[ev.FactID]; ok && st.Finalized && st.BlockHash == ev.BlockHash {
 			out = append(out, ev)
 		}
 	}
@@ -372,16 +630,26 @@ func (s *Sim) FinalizedFacts(kind string) []Event {
 func (s *Sim) VaultState() VaultState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	head := s.finalBalance
-	for _, b := range s.pending {
-		head += balanceDelta(b.Txs)
+	esc := make(map[string]int64, len(s.final.Escrow))
+	for k, v := range s.final.Escrow {
+		esc[k] = v
 	}
-	return VaultState{FinalizedBalance: s.finalBalance, HeadBalance: head,
-		Head: s.head, FinalizedHeight: s.finalHeight}
+	return VaultState{
+		FinalizedBalance: s.final.Balance, FinalizedFree: s.final.free(),
+		FinalizedEscrow: esc, HeadBalance: s.headLocked().Balance,
+		Head: s.head, FinalizedHeight: s.finalHeight,
+	}
+}
+
+// SettledOnChain reports whether the contract has recorded a market's outcome.
+func (s *Sim) SettledOnChain(market string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.final.Settled[market]
 }
 
 // CanonicalHash answers "is the block I derived that ledger entry from still
-// part of history?". A false second return means: it was reorged away.
+// part of history?". A false second return means it was reorged away.
 func (s *Sim) CanonicalHash(height int64) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -395,41 +663,32 @@ func evKind(txKind string) string {
 		return "deposit"
 	case "withdraw":
 		return "withdraw_processed"
+	case "escrow_set":
+		return "escrow_set"
 	case "settle_market":
 		return "market_settled"
+	case "cancel":
+		return "cancelled"
 	}
 	return txKind
-}
-
-func balanceDelta(txs []Tx) int64 {
-	var d int64
-	for _, tx := range txs {
-		switch tx.Kind {
-		case "deposit":
-			d += tx.Amount
-		case "withdraw":
-			d -= tx.Amount
-		}
-	}
-	return d
 }
 
 // ---------------------------------------------------------------- persistence
 
 // The chain state is written to disk so that a real `kill -9` of the process
-// (see scripts/crash_test.sh) leaves the chain standing while the service
-// restarts — which is the only way to test recovery honestly.
+// leaves the chain standing while the service restarts, which is the only way to
+// test recovery honestly.
 func (s *Sim) persistLocked() {
 	if s.path == "" {
 		return
 	}
-	hashes := map[string]block{}
+	hashes := make(map[string]string, len(s.hashAt))
 	for h, hash := range s.hashAt {
-		hashes[fmt.Sprint(h)] = block{Height: h, Hash: hash}
+		hashes[fmt.Sprint(h)] = hash
 	}
-	p := persisted{Head: s.head, FinalizedHeight: s.finalHeight, FinalizedBal: s.finalBalance,
-		Pending: s.pending, Finalised: hashes, Processed: s.processed, Log: s.log,
-		Seq: s.seq, Mempool: s.mempool, Expired: s.expired, Faults: s.faults}
+	p := persisted{Head: s.head, FinalHeight: s.finalHeight, Final: s.final,
+		Pending: s.pending, HashAt: hashes, Receipts: s.receipts, Log: s.log,
+		Seq: s.seq, Mempool: s.mempool, Faults: s.faults, NextDeposit: s.nextDeposit}
 	b, err := json.Marshal(p)
 	if err != nil {
 		return
@@ -449,19 +708,20 @@ func (s *Sim) load() error {
 	if err := json.Unmarshal(b, &p); err != nil {
 		return err
 	}
-	s.head, s.finalHeight, s.finalBalance = p.Head, p.FinalizedHeight, p.FinalizedBal
-	s.pending, s.processed, s.log, s.seq, s.mempool = p.Pending, p.Processed, p.Log, p.Seq, p.Mempool
-	if s.processed == nil {
-		s.processed = map[string]TxStatus{}
+	s.head, s.finalHeight = p.Head, p.FinalHeight
+	s.final, s.pending, s.receipts = p.Final, p.Pending, p.Receipts
+	s.log, s.seq, s.mempool, s.nextDeposit = p.Log, p.Seq, p.Mempool, p.NextDeposit
+	if s.final.Escrow == nil {
+		s.final = newVault()
 	}
-	if s.expired = p.Expired; s.expired == nil {
-		s.expired = map[string]bool{}
+	if s.receipts == nil {
+		s.receipts = map[string]TxStatus{}
 	}
-	for _, blk := range p.Finalised {
-		s.hashAt[blk.Height] = blk.Hash
-	}
-	for _, blk := range p.Pending {
-		s.hashAt[blk.Height] = blk.Hash
+	for hs, hash := range p.HashAt {
+		var h int64
+		if _, err := fmt.Sscan(hs, &h); err == nil {
+			s.hashAt[h] = hash
+		}
 	}
 	return nil
 }
@@ -471,8 +731,14 @@ func (s *Sim) Snapshot() map[string]any {
 	v := s.VaultState()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	settled := make([]string, 0, len(s.final.Settled))
+	for m := range s.final.Settled {
+		settled = append(settled, m)
+	}
+	sort.Strings(settled)
 	return map[string]any{
 		"vault": v, "faults": s.faults, "pending_blocks": len(s.pending),
 		"mempool": len(s.mempool), "events": len(s.log),
+		"escrow_total": v.EscrowTotal(), "settled_markets": strings.Join(settled, ","),
 	}
 }

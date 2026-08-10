@@ -27,6 +27,9 @@ type ChaosOptions struct {
 	Faults      chain.Faults
 	LogLevel    slog.Level
 	Fresh       bool
+	// TracePath, when set, records the simulator's finalised vault history so
+	// the Rust contract can replay it and confirm the two agree.
+	TracePath string
 }
 
 type ChaosResult struct {
@@ -100,6 +103,12 @@ func RunChaos(ctx context.Context, o ChaosOptions) (*ChaosResult, error) {
 	start := time.Now()
 	rnd := rand.New(rand.NewSource(o.Seed))
 	sim := chain.New(o.Seed, o.Faults, o.ChainState)
+	if o.TracePath != "" {
+		if err := sim.TraceTo(o.TracePath); err != nil {
+			return nil, err
+		}
+		defer func() { _ = sim.CloseTrace() }()
+	}
 
 	open := func() (*App, error) {
 		return New(ctx, Options{DSN: o.DSN, RedisURL: o.RedisURL, Seed: o.Seed,
@@ -273,6 +282,9 @@ func RunChaos(ctx context.Context, o ChaosOptions) (*ChaosResult, error) {
 		ticks := []func(context.Context) (int, error){a.OutboxTick, a.InboxTick, a.ResolverTick}
 		if rnd.Intn(100) < 40 {
 			ticks = append(ticks, a.LiquidatorTick)
+		}
+		if rnd.Intn(100) < 50 {
+			ticks = append(ticks, a.EscrowTick)
 		}
 		rnd.Shuffle(len(ticks), func(x, y int) { ticks[x], ticks[y] = ticks[y], ticks[x] })
 		for _, t := range ticks[:1+rnd.Intn(len(ticks))] {

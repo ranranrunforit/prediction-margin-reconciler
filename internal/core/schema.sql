@@ -63,6 +63,15 @@ create table if not exists intents (
 );
 create index if not exists intents_state_idx on intents (state);
 
+-- At most one escrow instruction per market may be in flight. This is the real
+-- idempotency key for escrow: not the value being installed, but the fact that
+-- somebody is already working on this market. Keying on the value instead looks
+-- natural and deadlocks -- once an instruction for target T expires, no new one
+-- for the same T can ever be created, and the market stays out of sync forever.
+create unique index if not exists intents_one_escrow_inflight_idx
+    on intents (market_id)
+    where kind = 'escrow_set' and state in ('reserved', 'submitted');
+
 -- Transactional outbox: written in the same DB transaction as the ledger move,
 -- so we never dual-write to Postgres and the chain.
 create table if not exists outbox (
@@ -175,6 +184,20 @@ create table if not exists system_state (
     key   text primary key,
     value text not null,
     at    timestamptz not null default now()
+);
+
+-- Escrow drift is normal: trading is off-chain and fast, and the chain converges
+-- behind it. What is not normal is drift that stops shrinking. This table counts
+-- how many reconciliation passes a market has been out of sync without an
+-- instruction closing it, so the invariant can be "converging" rather than the
+-- useless "never differs".
+create table if not exists escrow_drift (
+    market     text primary key references markets (id),
+    want       bigint not null,
+    got        bigint not null,
+    misses     int not null default 0,
+    first_seen timestamptz not null default now(),
+    updated_at timestamptz not null default now()
 );
 
 create table if not exists freezes (

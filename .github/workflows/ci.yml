@@ -28,19 +28,43 @@ jobs:
       REDIS_URL: redis://127.0.0.1:6379
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
         with: { go-version: '1.22', cache: true }
-      - run: gofmt -l . | tee /tmp/fmt && test ! -s /tmp/fmt
-      - run: go vet ./...
-      - run: go test ./... -count=1
+      - uses: actions/setup-node@v4
+        with: { node-version: '20', cache: 'npm', cache-dependency-path: ts/package-lock.json }
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: gofmt
+        run: gofmt -l . | tee /tmp/fmt && test ! -s /tmp/fmt
+      - name: go vet
+        run: go vet ./...
+
+      - name: contract tests (rust)
+        run: cargo test --manifest-path contracts/vault/Cargo.toml
+
+      - name: escalation policy tests (typescript)
+        run: cd ts && npm ci && npm test
+
+      - name: chaos harness (go test)
+        run: go test ./... -count=1
+
       - name: narrated failure-mode walkthrough
         run: go run ./cmd/pmr demo
+
       - name: chaos, five seeds
         run: |
           for s in 1 2 3 4 5; do
             go run ./cmd/pmr chaos -iterations 1500 -seed $s -crash-every 25 -verify-every 100
           done
+
+      - name: differential test against the rust contract
+        run: |
+          go run ./cmd/pmr trace -out /tmp/trace.txt
+          cargo run --manifest-path contracts/vault/Cargo.toml --bin replay -- /tmp/trace.txt
+
       - name: real SIGKILL recovery
-        # Invoke bash explicitly: Git commits created on Windows often do not
-        # preserve the executable bit on shell scripts.
-        run: bash ./scripts/crash_test.sh
+        run: bash scripts/crash_test.sh
+
+      - name: benchmarks
+        run: go run ./cmd/pmr bench -markets 500 -ticks 10

@@ -1,0 +1,20 @@
+{
+  "name": "pmr-watcher",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Typed alerting layer over the reconciler's HTTP API.",
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "test": "tsc && node --test dist/*.test.js",
+    "start": "tsc && node dist/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.14.0"
+  }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "vault"
+version = "0.1.0"
+edition = "2021"
+description = "The on-chain custody rules for the prediction-margin-reconciler, as a portable state machine."
+
+# No dependencies, on purpose. These are the custody rules, not a deployment
+# target: keeping them framework-free means they compile unchanged for CosmWasm,
+# Arbitrum Stylus or a Solana program, and it means CI runs `cargo test` in
+# seconds without a chain toolchain.
+[dependencies]
+
+[[bin]]
+name = "replay"
+path = "src/bin/replay.rs"
+
+[profile.release]
+overflow-checks = true

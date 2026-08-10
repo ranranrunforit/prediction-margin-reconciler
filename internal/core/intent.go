@@ -250,14 +250,17 @@ func (s *Store) Confirm(ctx context.Context, id string, height int64, blockHash 
 	})
 }
 
-// Expire refunds a reserved withdrawal that the chain provably never processed.
-func (s *Store) Expire(ctx context.Context, id string) error {
+// Expire refunds a reserved withdrawal only after the caller has observed the
+// chain beyond the contract-enforced expiry height. Passing that observation
+// into the store makes an early refund impossible even if a worker regresses.
+func (s *Store) Expire(ctx context.Context, id string, observedHeight int64) error {
 	return tx(ctx, s.db, func(x *sql.Tx) error {
 		var kind, user, state string
-		var amount int64
+		var amount, expiryHeight int64
 		if err := x.QueryRowContext(ctx, `
-            select kind, coalesce(user_id, ''), state, amount
-              from intents where id = $1 for update`, id).Scan(&kind, &user, &state, &amount); err != nil {
+			select kind, coalesce(user_id, ''), state, amount, expiry_height
+		  from intents where id = $1 for update`, id).
+			Scan(&kind, &user, &state, &amount, &expiryHeight); err != nil {
 			return err
 		}
 		if state == StateExpired {
@@ -267,6 +270,9 @@ func (s *Store) Expire(ctx context.Context, id string) error {
 			return fmt.Errorf("%w: cannot expire intent in state %s", ErrConflict, state)
 		}
 		if kind == "withdraw" {
+			if expiryHeight <= 0 || observedHeight <= expiryHeight {
+				return fmt.Errorf("%w: withdrawal %s has not reached expiry height", ErrConflict, id)
+			}
 			if _, _, err := PostTx(ctx, x, Transfer{
 				Kind:           "withdraw.refund",
 				IdempotencyKey: "intent:" + id + ":refund",

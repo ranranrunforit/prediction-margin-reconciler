@@ -356,11 +356,11 @@ func (a *App) ResolverTick(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	head := a.Chain.VaultState().Head
 	n := 0
 	for _, it := range inflight {
 		st := a.Chain.TxStatus(it.ID)
-		switch {
-		case st.Processed && st.Finalized:
+		if st.Processed && st.Finalized {
 			if err := a.Store.Confirm(ctx, it.ID, st.Height, st.BlockHash); err != nil {
 				if errors.Is(err, core.ErrConflict) {
 					continue
@@ -368,11 +368,17 @@ func (a *App) ResolverTick(ctx context.Context) (int, error) {
 				return n, err
 			}
 			n++
-		case st.Processed:
+			continue
+		}
+		if st.Processed {
 			// In a block but not final yet. Deliberately do nothing: we do
 			// not recognise money leaving until it cannot come back.
-		case it.ExpiryHt > 0 && a.Chain.VaultState().Head > it.ExpiryHt,
-			it.ExpiryHt == 0 && time.Now().After(it.Deadline):
+			continue
+		}
+
+		expiredByContract := it.ExpiryHt > 0 && head > it.ExpiryHt
+		expiredWithoutContract := it.ExpiryHt == 0 && time.Now().After(it.Deadline)
+		if expiredByContract || expiredWithoutContract {
 			// We only refund after the chain has advanced past the nonce's
 			// contract-enforced expiry height. A separate cached "expired" flag
 			// is not enough evidence: it can be stale or disagree with the nonce
@@ -384,7 +390,7 @@ func (a *App) ResolverTick(ctx context.Context) (int, error) {
 			// decided it had failed -- and then the chain pays out money we
 			// already gave back. The expiry has to be enforced by the same
 			// authority that would execute the transfer.
-			if err := a.Store.Expire(ctx, it.ID); err != nil {
+			if err := a.Store.Expire(ctx, it.ID, head); err != nil {
 				if errors.Is(err, core.ErrConflict) {
 					continue
 				}

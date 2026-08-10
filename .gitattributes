@@ -1,0 +1,8 @@
+# Normalise everything to LF in the repository. Without this, a clone on a
+# machine with a different core.autocrlf setting can commit CRLF into a shell
+# script, and the only symptom on Linux is `$'"'"'\r'"'"': command not found`.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gz  binary

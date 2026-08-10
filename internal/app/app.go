@@ -371,10 +371,13 @@ func (a *App) ResolverTick(ctx context.Context) (int, error) {
 		case st.Processed:
 			// In a block but not final yet. Deliberately do nothing: we do
 			// not recognise money leaving until it cannot come back.
-		case a.Chain.Expired(it.ID) || (it.ExpiryHt > 0 && a.Chain.VaultState().Head > it.ExpiryHt),
+		case it.ExpiryHt > 0 && a.Chain.VaultState().Head > it.ExpiryHt,
 			it.ExpiryHt == 0 && time.Now().After(it.Deadline):
-			// The contract itself will now refuse this nonce, so the money can
-			// only be in one place: with us. Refunding is safe.
+			// We only refund after the chain has advanced past the nonce's
+			// contract-enforced expiry height. A separate cached "expired" flag
+			// is not enough evidence: it can be stale or disagree with the nonce
+			// status during recovery. At this height the contract will refuse a
+			// late submission, so the money can only be in one place: with us.
 			//
 			// A wall-clock deadline on its own would not be enough. A tx can
 			// sit in a mempool, or come back from a reorg, and land after we

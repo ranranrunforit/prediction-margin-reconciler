@@ -52,16 +52,25 @@ RESULT: all 8 invariants hold after chaos
 
 ```
 $ make differential
-replayed 806 finalised call(s): 806 applied, 0 refused
-  end state: balance=62063000000 escrow_total=40184487 height=810
+replayed 769 finalised call(s): 769 applied, 0 refused
+  end state: balance=61852000000 escrow_total=40184487 height=792
 OK: the Rust contract and the Go simulator agree exactly
 ```
 
+The call count moves around between runs for the reason above; what must not move
+is the last line.
+
 `make chaos-clean` is the control group: the same workload with no faults injected.
-If that ever fails, the bug is in the engine, not in the fault injection. Every run
-is reproducible from its seed — each worker is a single-shot `Tick` method and the
-harness calls them in a seeded random order, so there is no hidden concurrency in
-the control flow.
+If that ever fails, the bug is in the engine, not in the fault injection.
+
+The **workload** is reproducible from its seed — each worker is a single-shot `Tick`
+method and the harness calls them in a seeded random order, so there is no hidden
+concurrency in the control flow. The **counts** are not, and deliberately so: an
+intent's deadline is wall-clock, so a slower machine expires a few more withdrawals
+and the totals shift by a percent or two between runs. Making those deadlines
+tick-based would buy a prettier transcript at the cost of the system no longer
+behaving like one with real timeouts in it. The invariants are what has to be
+identical every time, and they are.
 
 ---
 
@@ -466,6 +475,9 @@ residue boxed in red when it is non-zero. There is a button that injects a phant
 credit — balanced double entry and all — so you can watch the ledger stay
 internally perfect while reconciliation catches it and halts withdrawals.
 
+The panel does not yet show the per-market escrow dimension. `/api/state` returns
+it and `pmr verify` checks it (I7); only the rendering is missing.
+
 ---
 
 ## Scope, deliberately
@@ -498,6 +510,12 @@ Not built, on purpose:
 
 Requires Go 1.22+, Postgres 16, Rust (for the contract), Node 20+ (for the
 watcher). Redis is optional — it falls back to an in-memory cache and says so.
+
+The fastest path is a GitHub Codespace: the default image already has Go, Rust and
+Node, so `make db && make demo` works with nothing installed locally. Codespaces
+will offer to forward ports 5432 and 6379 as well — those speak Postgres and Redis
+wire protocols, not HTTP, so opening them in a browser returns a 502. Port 8080 is
+the one to open.
 
 ```bash
 make db

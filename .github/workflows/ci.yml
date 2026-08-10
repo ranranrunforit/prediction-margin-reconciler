@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push: { branches: [main] }
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pmr
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s
+          --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s
+          --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/pmr?sslmode=disable
+      REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.22', cache: true }
+      - run: gofmt -l . | tee /tmp/fmt && test ! -s /tmp/fmt
+      - run: go vet ./...
+      - run: go test ./... -count=1
+      - name: narrated failure-mode walkthrough
+        run: go run ./cmd/pmr demo
+      - name: chaos, five seeds
+        run: |
+          for s in 1 2 3 4 5; do
+            go run ./cmd/pmr chaos -iterations 1500 -seed $s -crash-every 25 -verify-every 100
+          done
+      - name: real SIGKILL recovery
+        run: ./scripts/crash_test.sh

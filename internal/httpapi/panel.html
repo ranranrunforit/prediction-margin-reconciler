@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reconciler — prediction margin engine</title>
+<style>
+  :root {
+    --ink: #0d1014; --panel: #14191f; --line: #232b34;
+    --fg: #c8d2de; --dim: #6d7b8a; --faint: #414d59;
+    --ok: #5fb98c; --warn: #d9a24c; --bad: #d95757; --cyan: #6fb3d2;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--ink); color: var(--fg);
+    font: 400 13px/1.6 var(--mono); letter-spacing: 0.01em;
+    padding: 28px 22px 60px;
+  }
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 26px; }
+  h1 { font-size: 13px; font-weight: 500; letter-spacing: 0.22em; text-transform: uppercase; margin: 0; }
+  header .sub { color: var(--faint); font-size: 12px; }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--line); padding: 16px 18px; }
+  .card h2 {
+    font-size: 11px; font-weight: 500; letter-spacing: 0.18em; text-transform: uppercase;
+    color: var(--dim); margin: 0 0 12px;
+  }
+
+  /* Signature: the reconciliation identity, rendered as an equation. */
+  .eq { border: 1px solid var(--line); background: var(--panel); padding: 22px 18px; margin-bottom: 14px; }
+  .eq .row { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
+  .term { display: flex; flex-direction: column; gap: 4px; min-width: 92px; }
+  .term .lbl { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
+  .term .val { font-size: 20px; font-weight: 500; font-variant-numeric: tabular-nums; }
+  .op { font-size: 20px; color: var(--faint); padding-bottom: 4px; }
+  .residue { border: 1px solid var(--line); padding: 6px 12px; }
+  .residue.zero { border-color: var(--ok); }
+  .residue.zero .val { color: var(--ok); }
+  .residue.nonzero { border-color: var(--bad); background: #1d1315; }
+  .residue.nonzero .val { color: var(--bad); }
+  .verdict { margin-top: 14px; font-size: 12px; color: var(--dim); }
+  .verdict b { font-weight: 500; }
+  .s-ok b { color: var(--ok); } .s-explained b { color: var(--cyan); }
+  .s-unsafe_shortfall b { color: var(--bad); } .s-unsafe_surplus b { color: var(--warn); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; font-weight: 400; color: var(--faint); padding: 0 8px 6px 0;
+       font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; }
+  td { padding: 3px 8px 3px 0; border-top: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  td.n { text-align: right; }
+  .pass { color: var(--ok); } .failx { color: var(--bad); } .muted { color: var(--dim); }
+  .pill { border: 1px solid var(--faint); padding: 0 5px; font-size: 11px; color: var(--dim); }
+
+  button {
+    font: inherit; color: var(--fg); background: #1b222a; border: 1px solid var(--line);
+    padding: 5px 10px; cursor: pointer;
+  }
+  button:hover { border-color: var(--dim); }
+  button:focus-visible { outline: 2px solid var(--cyan); outline-offset: 1px; }
+  button.danger { color: var(--bad); border-color: #3a2226; }
+  .controls { display: flex; gap: 6px; flex-wrap: wrap; }
+  input { font: inherit; width: 76px; background: #0f1419; color: var(--fg);
+          border: 1px solid var(--line); padding: 4px 6px; }
+  .banner { border: 1px solid var(--bad); background: #1d1315; color: var(--bad);
+            padding: 10px 14px; margin-bottom: 14px; font-size: 12px; }
+  .empty { color: var(--faint); font-size: 12px; }
+  @media (prefers-reduced-motion: no-preference) {
+    .flash { animation: f 420ms ease-out; }
+    @keyframes f { from { background: #2a1b1f; } to { background: transparent; } }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Reconciler</h1>
+  <span class="sub">prediction-market margin engine · off-chain ledger vs on-chain vault</span>
+  <span class="sub" id="feed"></span>
+</header>
+
+<div id="halt"></div>
+
+<section class="eq" aria-label="Reconciliation identity">
+  <div class="row">
+    <div class="term"><span class="lbl">ledger</span><span class="val" id="t-ledger">—</span></div>
+    <span class="op">−</span>
+    <div class="term"><span class="lbl">chain final</span><span class="val" id="t-chain">—</span></div>
+    <span class="op">=</span>
+    <div class="term"><span class="lbl">paid, unbooked</span><span class="val" id="t-w">—</span></div>
+    <span class="op">−</span>
+    <div class="term"><span class="lbl">deposits missed</span><span class="val" id="t-d">—</span></div>
+    <span class="op">+</span>
+    <div class="term"><span class="lbl">provisional</span><span class="val" id="t-p">—</span></div>
+    <span class="op">+</span>
+    <div class="term residue" id="res"><span class="lbl">residue</span><span class="val" id="t-r">—</span></div>
+  </div>
+  <p class="verdict" id="verdict"></p>
+</section>
+
+<div class="grid">
+  <div class="card">
+    <h2>Invariants</h2>
+    <table id="inv"></table>
+  </div>
+
+  <div class="card">
+    <h2>In flight</h2>
+    <div id="intents"></div>
+  </div>
+
+  <div class="card">
+    <h2>Balances</h2>
+    <table id="bals"></table>
+  </div>
+
+  <div class="card">
+    <h2>Move money</h2>
+    <div class="controls">
+      user <input id="user" value="alice">
+      amount <input id="amt" value="100">
+      <button data-act="deposit">Deposit on chain</button>
+      <button data-act="withdraw">Request withdrawal</button>
+    </div>
+    <div class="controls" style="margin-top:8px">
+      market <input id="mkt" value="m00">
+      <button data-act="position">Open long</button>
+      <button data-act="settle">Resolve YES</button>
+    </div>
+    <div class="controls" style="margin-top:8px">
+      <button class="danger" data-act="inject-shortfall">Inject a phantom credit</button>
+      <button data-act="unfreeze">Clear halt</button>
+    </div>
+    <p class="empty" style="margin:10px 0 0">A phantom credit keeps double entry intact, so the ledger
+    alone still looks healthy. Only reconciliation against the chain catches it.</p>
+  </div>
+
+  <div class="card">
+    <h2>Chain</h2>
+    <table id="chain"></table>
+  </div>
+
+  <div class="card">
+    <h2>Markets</h2>
+    <table id="markets"></table>
+  </div>
+</div>
+
+<script>
+const usd = v => (v / 1e6).toLocaleString(undefined, { maximumFractionDigits: 2 });
+const pct = v => (v / 1e4).toFixed(1) + '%';
+let lastResidue = null;
+
+async function post(path, extra) {
+  const r = await fetch('/api/' + path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(Object.assign({
+      user: document.getElementById('user').value,
+      market: document.getElementById('mkt').value,
+      amount: parseFloat(document.getElementById('amt').value) || 0,
+      size: 50, outcome: 1
+    }, extra || {}))
+  });
+  return r.json();
+}
+
+document.querySelectorAll('button[data-act]').forEach(b =>
+  b.addEventListener('click', async () => { await post(b.dataset.act); refresh(); }));
+
+function rows(tbl, head, data, render) {
+  const t = document.getElementById(tbl);
+  if (!data || !data.length) { t.innerHTML = '<tr><td class="empty">nothing here</td></tr>'; return; }
+  t.innerHTML = '<tr>' + head.map(h => `<th>${h}</th>`).join('') + '</tr>' + data.map(render).join('');
+}
+
+async function refresh() {
+  let s;
+  try { s = await (await fetch('/api/state')).json(); } catch (e) { return; }
+  const r = s.reconciliation, t = r.terms;
+
+  document.getElementById('feed').textContent = '· price cache: ' + s.feed;
+  document.getElementById('t-ledger').textContent = usd(r.ledger_internal);
+  document.getElementById('t-chain').textContent = usd(r.chain_finalized);
+  document.getElementById('t-w').textContent = usd(t.withdrawn_not_recognised);
+  document.getElementById('t-d').textContent = usd(t.deposits_not_ingested);
+  document.getElementById('t-p').textContent = usd(t.provisional_credits);
+  document.getElementById('t-r').textContent = usd(r.unexplained);
+
+  const res = document.getElementById('res');
+  res.className = 'term residue ' + (r.unexplained === 0 ? 'zero' : 'nonzero');
+  if (lastResidue !== null && lastResidue !== r.unexplained) {
+    res.classList.add('flash'); setTimeout(() => res.classList.remove('flash'), 450);
+  }
+  lastResidue = r.unexplained;
+
+  const v = document.getElementById('verdict');
+  v.className = 'verdict s-' + r.status;
+  v.innerHTML = `status <b>${r.status}</b> · ${r.in_flight_intents} intent(s) in flight`
+    + (r.healed_from_chain_state ? ` · healed ${r.healed_from_chain_state} deposit(s) from chain state` : '')
+    + (r.note ? ` · ${r.note}` : '');
+
+  const halted = s.freezes && s.freezes['*'];
+  document.getElementById('halt').innerHTML = halted
+    ? `<div class="banner">Withdrawals halted — ${halted}</div>` : '';
+
+  const broken = {};
+  (s.violations || []).forEach(x => { (broken[x.id] = broken[x.id] || []).push(x.detail); });
+  rows('inv', ['', 'invariant', ''], s.invariants, i => {
+    const bad = broken[i.ID];
+    return `<tr><td class="${bad ? 'failx' : 'pass'}">${bad ? 'FAIL' : 'pass'}</td>`
+      + `<td>${i.ID} ${i.Name}</td><td class="muted">${bad ? bad.join('; ') : ''}</td></tr>`;
+  });
+
+  const its = s.intents || [];
+  document.getElementById('intents').innerHTML = its.length
+    ? '<table>' + '<tr><th>id</th><th>kind</th><th>user</th><th>amount</th><th>ledger</th><th>chain</th><th>try</th></tr>'
+      + its.map(i => `<tr><td class="muted">${i.id}</td><td>${i.kind}</td><td>${i.user}</td>`
+        + `<td class="n">${usd(i.amount)}</td><td><span class="pill">${i.state}</span></td>`
+        + `<td class="muted">${i.on_chain}</td><td class="n">${i.attempts}</td></tr>`).join('')
+      + '</table>'
+    : '<p class="empty">No in-flight intents. Ledger and chain must match exactly right now.</p>';
+
+  rows('bals', ['account', 'balance'], s.balances,
+    b => `<tr><td>${b.account}</td><td class="n">${usd(b.balance)}</td></tr>`);
+
+  const c = s.chain, f = c.faults;
+  rows('chain', ['', ''], [
+    ['head / finalized', c.vault.head + ' / ' + c.vault.finalized_height],
+    ['vault (finalized)', usd(c.vault.finalized_balance)],
+    ['vault (head)', usd(c.vault.head_balance)],
+    ['mempool / events', c.mempool + ' / ' + c.events],
+    ['confirmations', f.confirms],
+    ['injected faults', `submit ${pct(f.submit_error*1e6)} · lost receipt ${pct(f.lost_receipt*1e6)} · dup ${pct(f.duplicate*1e6)} · gap ${pct(f.gap*1e6)} · reorg ${pct(f.reorg*1e6)}`]
+  ], r => `<tr><td class="muted">${r[0]}</td><td>${r[1]}</td></tr>`);
+
+  rows('markets', ['market', 'mark', 'state'], s.markets,
+    m => `<tr><td>${m.id}</td><td class="n">${(m.mark/1e4).toFixed(1)}%</td><td class="muted">${m.state}</td></tr>`);
+}
+
+refresh();
+setInterval(refresh, 1200);
+</script>
+</body>
+</html>
